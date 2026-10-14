@@ -70,6 +70,7 @@ pub struct BrowserState {
     tab_counter: u32,
     context: Arc<BrowserContext>,
     user_agent: Option<String>,
+    operator_network_hints: bool,
     console_messages: Vec<String>,
     /// Element-ref table from the last `browser_snapshot` on the ACTIVE
     /// tab. Agents click / fill / type by `ref` (e.g. `"e3"`) instead of
@@ -81,12 +82,25 @@ pub struct BrowserState {
 
 impl BrowserState {
     pub fn new(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Self {
+        // `--storage-dir` is a global flag, so the profile arrives through the
+        // environment rather than through every constructor call. Without this
+        // the MCP path silently ignored the flag and persisted nothing, cookies
+        // included.
+        let storage_dir = std::env::var_os("OBSCURA_STORAGE_DIR").map(std::path::PathBuf::from);
+        let context = BrowserContext::with_storage_full(
+            "mcp".to_string(),
+            proxy,
+            stealth,
+            None,
+            storage_dir,
+        );
         BrowserState {
             tabs: std::collections::BTreeMap::new(),
             active_tab: None,
             tab_counter: 0,
-            context: Arc::new(BrowserContext::with_options("mcp".to_string(), proxy, stealth)),
+            context: Arc::new(context),
             user_agent,
+            operator_network_hints: false,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
         }
@@ -243,6 +257,9 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
     let mut writer = stdout;
 
     let mut state = BrowserState::new(proxy, user_agent, stealth);
+    state.operator_network_hints = true;
+    // Cookies and Web Storage are written on every navigation; this covers the
+    // writes an agent makes after a page has settled, on the way out.
     let mut runtime_pump_armed = false;
 
     loop {
@@ -270,6 +287,7 @@ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: boo
             continue;
         };
         if n == 0 {
+            state.context.save_storage();
             return Ok(());
         }
 
@@ -412,9 +430,23 @@ fn handle_tools_list(id: Value) -> RpcResponse {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "expression": { "type": "string", "description": "JavaScript expression to evaluate" }
+                        "expression": { "type": "string", "description": "JavaScript expression to evaluate; a promise it returns is awaited" },
+                        "timeoutMs": { "type": "number", "description": "How long to wait for a returned promise, in milliseconds (default: 5000)" }
                     },
                     "required": ["expression"]
+                }
+            },
+            {
+                "name": "browser_wait_for_function",
+                "description": "Wait until a JavaScript expression returns true, polling the page",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "function": { "type": "string", "description": "JavaScript expression that must become truthy" },
+                        "timeout": { "type": "number", "description": "Timeout in milliseconds (default: 30000)" },
+                        "pollIntervalMs": { "type": "number", "description": "Poll interval in milliseconds (default: 100)" }
+                    },
+                    "required": ["function"]
                 }
             },
             {
@@ -768,6 +800,7 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_select_option" => tool_select_option(args, state),
         "browser_evaluate" => tool_evaluate(args, state).await,
         "browser_wait_for" => tool_wait_for(args, state).await,
+        "browser_wait_for_function" => tool_wait_for_function(args, state).await,
         "browser_network_requests" => tool_network_requests(state),
         "browser_console_messages" => tool_console_messages(state),
         "browser_close" => tool_close(state),
@@ -937,17 +970,32 @@ fn truncate(text: &str, max_chars: usize) -> String {
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str)
         .ok_or("Missing url parameter")?;
+    if url::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| parsed.scheme() == "file")
+    {
+        return Err("file:// navigation is disabled for MCP".to_string());
+    }
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
     let ua = state.user_agent.clone();
+    let operator_hints = state.operator_network_hints;
     let page = state.page_mut();
     if let Some(ref ua) = ua {
         page.http_client.set_user_agent(ua).await;
     }
 
     page.navigate_with_wait(url, condition).await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let message = e.to_string();
+            if operator_hints {
+                if let Some(hint) = obscura_net::private_network_error_hint(&message) {
+                    return format!("{}\n{}", message, hint);
+                }
+            }
+            message
+        })?;
 
     let summary = format!("Navigated to {} — \"{}\"", page.url_string(), page.title);
     // DOM changed — invalidate the ref table. Next snapshot will rebuild.
@@ -1118,17 +1166,145 @@ fn tool_select_option(args: &Value, state: &mut BrowserState) -> Result<String, 
     }
 }
 
+/// Wrap an expression so a thenable it returns can be polled to settlement.
+/// Separate from the polling loop so its shape can be asserted directly: a
+/// wrapper that dereferences its slot before creating it turns every
+/// synchronous expression into "did not settle".
+fn expression_wrapper(expression: &str) -> String {
+    const SLOT: &str = "__obscura_mcp_expression";
+    format!(
+        r#"(function() {{
+            var slot = globalThis.{SLOT} || (globalThis.{SLOT} = {{}});
+            slot.state = 'pending';
+            try {{
+                var value = ({expression});
+                if (value && typeof value.then === 'function') {{
+                    value.then(
+                        function (resolved) {{ slot.state = 'done'; slot.value = resolved; }},
+                        function (rejected) {{ slot.state = 'failed'; slot.error = String(rejected); }}
+                    );
+                    return null;
+                }}
+                slot.state = 'sync';
+                slot.value = value;
+                return null;
+            }} catch (e) {{ slot.state = 'sync'; slot.value = null; slot.error = String(e); return null; }}
+        }})()"#,
+        SLOT = SLOT,
+        expression = expression,
+    )
+}
+/// Resolve a promise that a page expression produced.
+///
+/// `Page::evaluate` is synchronous, so an agent that wrote `await fetch(...)`
+/// or an async IIFE used to get `{}` back and no way to tell that from an empty
+/// object. The expression is evaluated once, and if the result is a thenable its
+/// settlement is polled until it resolves, fails, or the timeout runs out.
+async fn settle_expression_promise(
+    state: &mut BrowserState,
+    expression: &str,
+    timeout: std::time::Duration,
+) -> Option<Value> {
+    let wrapped = expression_wrapper(expression);
+    const SLOT: &str = "__obscura_mcp_expression";
+    let seed = state.page_mut().evaluate(&wrapped);
+    if seed.is_null() && !state.page_mut().has_js() {
+        // No realm: nothing can produce a thenable here.
+        return None;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last: Option<Value> = None;
+    loop {
+        let snapshot = state.page_mut().evaluate(&format!(
+            "JSON.stringify((function() {{ var s = globalThis.{SLOT}; return s ? {{state: s.state, value: s.value, error: s.error}} : null; }})())"
+        ));
+        let parsed = snapshot
+            .as_str()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        if let Some(slot) = parsed {
+            match slot.get("state").and_then(Value::as_str) {
+                Some("pending") => last = slot.get("value").cloned(),
+                Some("sync") => return slot.get("value").cloned(),
+                Some("done") => return slot.get("value").cloned(),
+                Some("failed") => return Some(Value::String(
+                    slot.get("error").and_then(Value::as_str).unwrap_or("rejected").to_string(),
+                )),
+                _ => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(Value::String(format!(
+                "{{\"error\":\"the expression did not settle within {} ms\"}}",
+                timeout.as_millis()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // A promise that settles in a network callback needs the page's own
+        // task queue to turn. Polling evaluate alone leaves it pending forever,
+        // which is how `await fetch(...)` looked like a hang.
+        let _ = state.advance_active_page_tasks().await;
+        let _ = last;
+    }
+}
+
 async fn tool_evaluate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let expression = args.get("expression").and_then(Value::as_str)
         .ok_or("Missing expression parameter")?;
+    let timeout_ms = args.get("timeoutMs").and_then(Value::as_u64).unwrap_or(5_000);
 
-    let result = state.page_mut().evaluate(expression);
+    let result = match settle_expression_promise(
+        state,
+        expression,
+        std::time::Duration::from_millis(timeout_ms),
+    )
+    .await
+    {
+        Some(value) => value,
+        // Fall back to the synchronous reading if the promise machinery was
+        // unavailable, so this can only ever return more than before.
+        None => state.page_mut().evaluate(expression),
+    };
     state.settle_synthetic_navigation().await?;
     Ok(match &result {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_string(),
         other => serde_json::to_string_pretty(other).unwrap_or_default(),
     })
+}
+
+/// Poll a JavaScript predicate until it returns something truthy.
+///
+/// Agents otherwise express "wait until the app finished loading" as a loop of
+/// `browser_evaluate` plus a sleep, which costs a round trip per iteration and
+/// is where flaky automation comes from.
+async fn tool_wait_for_function(args: &Value, state: &mut BrowserState) -> Result<String, String> {
+    let expression = args.get("function").or_else(|| args.get("expression"))
+        .and_then(Value::as_str)
+        .ok_or("Missing function parameter")?;
+    let timeout_ms = args.get("timeout").and_then(Value::as_u64).unwrap_or(30_000);
+    let poll_ms = args.get("pollIntervalMs").and_then(Value::as_u64).unwrap_or(100).max(10);
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+    let mut attempts: u64 = 0;
+    loop {
+        attempts += 1;
+        let value = state
+            .page_mut()
+            .evaluate(&format!("JSON.stringify((function(){{ try {{ return (function(){{ return !!({expression}); }})(); }} catch (e) {{ return false; }} }})())"));
+        let truthy = value
+            .as_str()
+            .map(|raw| raw == "true")
+            .unwrap_or(value.as_bool().unwrap_or(false));
+        if truthy {
+            return Ok(format!("condition met after {attempts} poll(s)"));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "condition not met within {timeout_ms} ms after {attempts} poll(s): {expression}"
+            ));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
+    }
 }
 
 async fn tool_wait_for(args: &Value, state: &mut BrowserState) -> Result<String, String> {
@@ -1952,17 +2128,64 @@ fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String>
             .unwrap_or_default()
     }).unwrap_or_default();
 
-    let haystack = if case_sensitive { body.clone() } else { body.to_lowercase() };
+    let out = search_body(&body, query, case_sensitive, context, limit);
+    if out.is_empty() {
+        Ok(format!("No matches for {query:?}."))
+    } else {
+        Ok(format!("{} match(es). {}", out.len(),
+            out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n")))
+    }
+}
+
+/// Case-(in)sensitive substring search returning `{offset, snippet}` per match,
+/// where `offset` is a byte offset into `body` and the snippet has `context`
+/// bytes of surrounding text snapped to word boundaries.
+fn search_body(
+    body: &str,
+    query: &str,
+    case_sensitive: bool,
+    context: usize,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    // Build the case-folded haystack and, for the case-insensitive path, a map
+    // from each haystack byte offset back to the corresponding byte offset in
+    // `body`. to_lowercase() can change byte length (e.g. "İ" U+0130 -> "i̇"),
+    // so a haystack byte offset is not a valid index into the original body.
+    let (haystack, offset_map) = if case_sensitive {
+        (body.to_string(), None)
+    } else {
+        let mut hs = String::with_capacity(body.len());
+        let mut map: Vec<usize> = Vec::with_capacity(body.len() + 1);
+        for (byte_idx, ch) in body.char_indices() {
+            for lc in ch.to_lowercase() {
+                let mut buf = [0u8; 4];
+                let encoded = lc.encode_utf8(&mut buf);
+                for _ in 0..encoded.len() {
+                    map.push(byte_idx);
+                }
+                hs.push_str(encoded);
+            }
+        }
+        map.push(body.len());
+        (hs, Some(map))
+    };
     let needle = if case_sensitive { query.to_string() } else { query.to_lowercase() };
+    let to_body = |hs_off: usize| -> usize {
+        match &offset_map {
+            Some(map) => map.get(hs_off).copied().unwrap_or(body.len()),
+            None => hs_off,
+        }
+    };
 
     let mut out = Vec::new();
     let mut idx = 0;
     while let Some(pos) = haystack[idx..].find(&needle) {
-        let abs = idx + pos;
-        let mut start = abs.saturating_sub(context);
-        let mut end = (abs + needle.len() + context).min(body.len());
-        // start/end are byte offsets derived from char counts and needle.len(),
-        // so they can land inside a multi-byte (CJK) character. Snap to char
+        let hs_abs = idx + pos;
+        let match_start = to_body(hs_abs);
+        let match_end = to_body(hs_abs + needle.len());
+        let mut start = match_start.saturating_sub(context);
+        let mut end = (match_end + context).min(body.len());
+        // start/end can land inside a multi-byte character; snap to char
         // boundaries before slicing or body[..start] panics (#257).
         while start > 0 && !body.is_char_boundary(start) { start -= 1; }
         while end < body.len() && !body.is_char_boundary(end) { end += 1; }
@@ -1975,18 +2198,13 @@ fn tool_search(args: &Value, state: &mut BrowserState) -> Result<String, String>
         }
         let snippet = body.get(start..end).unwrap_or("").trim().replace('\n', " ");
         out.push(json!({
-            "offset": abs,
+            "offset": match_start,
             "snippet": snippet,
         }));
-        idx = abs + needle.len();
+        idx = hs_abs + needle.len();
         if out.len() >= limit { break; }
     }
-    if out.is_empty() {
-        Ok(format!("No matches for {query:?}."))
-    } else {
-        Ok(format!("{} match(es). {}", out.len(),
-            out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n")))
-    }
+    out
 }
 
 /// Export full session state: cookies + localStorage + sessionStorage
@@ -2090,6 +2308,49 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
 mod tests {
     use super::*;
 
+    // The promise wrapper has to work on a page that has never been evaluated
+    // on: the slot is created lazily, so the first synchronous expression must
+    // not throw on an undefined global. This caught a regression where every
+    // browser_evaluate answered "the expression did not settle".
+    #[test]
+    fn expression_promise_wrapper_creates_its_slot_before_writing_to_it() {
+        let wrapped = expression_wrapper("1 + 1");
+        // A wrapper that dereferences the slot before creating it throws on the
+        // first synchronous expression, which surfaced as every
+        // browser_evaluate answering "the expression did not settle".
+        assert!(
+            wrapped.contains("globalThis.__obscura_mcp_expression || (globalThis.__obscura_mcp_expression = {})"),
+            "the slot must be created on demand: {wrapped}"
+        );
+        assert!(wrapped.contains("slot.state = 'sync'"), "sync results must be recorded: {wrapped}");
+        assert!(wrapped.contains("typeof value.then === 'function'"), "thenables must be awaited: {wrapped}");
+    }
+
+    // #1015: case-folding can change byte length (Turkish "İ" -> "i̇"), so a
+    // match offset found in the lowercased haystack must be translated back to
+    // the original body's byte offset.
+    #[test]
+    fn search_body_maps_offsets_through_unicode_lowercasing() {
+        let body = "İstanbul hava durumu";
+        let results = search_body(body, "HAVA", false, 5, 10);
+        assert_eq!(results.len(), 1, "should find one match");
+        let offset = results[0]["offset"].as_u64().unwrap() as usize;
+        assert_eq!(
+            offset,
+            body.find("hava").unwrap(),
+            "offset must be the byte position of the match in the original body"
+        );
+        assert!(
+            results[0]["snippet"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("hava"),
+            "snippet must contain the match, got {}",
+            results[0]["snippet"]
+        );
+    }
+
     fn listed_tools() -> Vec<Value> {
         handle_tools_list(json!(1)).result.expect("tools/list result")
             .get("tools").and_then(Value::as_array).cloned().expect("tools array")
@@ -2116,6 +2377,85 @@ mod tests {
         assert!(tools.iter().all(|tool| {
             tool["name"] != "browser_screenshot" && tool["name"] != "browser_pdf"
         }));
+    }
+
+    #[tokio::test]
+    async fn local_network_hint_is_limited_to_operator_stdio_state() {
+        std::env::remove_var("OBSCURA_ALLOW_PRIVATE_NETWORK");
+        let mut state = BrowserState::new(None, None, false);
+        let args = json!({"url": "http://localhost:9/"});
+        let remote_error = tool_navigate(&args, &mut state).await.unwrap_err();
+        assert!(remote_error.contains("is not allowed"));
+        assert!(!remote_error.contains("--allow-private-network"));
+        state.operator_network_hints = true;
+        let local_error = tool_navigate(&args, &mut state).await.unwrap_err();
+        assert!(local_error.contains("is not allowed"));
+        assert!(local_error.contains("--allow-private-network"));
+        assert!(local_error.contains("OBSCURA_ALLOW_PRIVATE_NETWORK=1"));
+        let metadata_error = tool_navigate(&json!({"url":"http://169.254.169.254/latest/meta-data/"}), &mut state).await.unwrap_err();
+        assert!(metadata_error.contains("is not allowed"));
+        assert!(!metadata_error.contains("--allow-private-network"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_navigation_rejects_local_files() {
+        let mut state = BrowserState::new(None, None, false);
+        let error = tool_navigate(&json!({"url": "file:///etc/passwd"}), &mut state)
+            .await
+            .expect_err("MCP must not expose local files");
+        assert!(error.contains("file:// navigation is disabled"));
+    }
+
+    // Every MCP route that navigates must refuse local files, not only
+    // browser_navigate: the browser layer enforces it for all of them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_tab_new_rejects_local_files() {
+        let mut state = BrowserState::new(None, None, false);
+        let error = tool_tab_new(&json!({"url": "file:///etc/passwd"}), &mut state)
+            .await
+            .expect_err("browser_tab_new must not expose local files");
+        assert!(error.contains("file://"), "{error}");
+        assert!(!state.page_mut().url_string().starts_with("file:"));
+    }
+
+    // An untrusted page must not be able to pull a local file into the agent's
+    // context by planting a file:// link for the agent to click.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_click_cannot_follow_a_link_into_file_scheme() {
+        let path = std::env::temp_dir().join(format!("obscura-mcp-file-link-{}.html", std::process::id()));
+        std::fs::write(&path, "<p>local-secret</p>").expect("write fixture");
+        let file_url = url::Url::from_file_path(&path).expect("file url").to_string();
+
+        let mut state = BrowserState::new(None, None, false);
+        state
+            .page_mut()
+            .navigate(&format!("data:text/html,<a id=l href='{file_url}'>go</a>"))
+            .await
+            .expect("web page");
+        let web_url = state.page_mut().url_string();
+
+        let click = handle_tool_call(
+            json!(1),
+            &json!({"name": "browser_click", "arguments": {"selector": "#l"}}),
+            &mut state,
+        )
+        .await
+        .result
+        .expect("click response");
+        assert_ne!(click["isError"], true, "{click}");
+        assert_eq!(state.page_mut().url_string(), web_url);
+
+        let snapshot = handle_tool_call(
+            json!(2),
+            &json!({"name": "browser_snapshot", "arguments": {}}),
+            &mut state,
+        )
+        .await
+        .result
+        .expect("snapshot response");
+        assert!(!snapshot.to_string().contains("local-secret"), "{snapshot}");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(feature = "render")]

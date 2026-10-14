@@ -71,6 +71,12 @@ The open-source engine stays Apache-2.0, fully featured. No feature gating, ever
 <br>
 **[📅 Book a demo →](https://cal.com/obscura/quick-chat)**
 
+### Open Source Support
+
+<a href="https://vercel.com/open-source-program">
+  <img alt="Vercel OSS Program" src="https://vercel.com/oss/program-badge-2026.svg" />
+</a>
+
 ## Sponsors
 
 **Obscura** is supported by organizations helping us build independent open-source browser infrastructure.
@@ -80,13 +86,13 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 <table>
    <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven2.png" width="180"/>
+      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">
+        <img alt="NodeMaven" src="assets/sponsors/nodemaven3.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
-      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
-      <b>Why <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">NodeMaven</a>?</b><br>
+      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
+      <b>Why <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">NodeMaven</a>?</b><br>
       ZIP targeting<br>
       99.9% uptime<br>
       IP filtering: all proxies have fraud score &lt;97%<br>
@@ -115,18 +121,6 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
     </b>
     Better proxies. Fewer blocks. More scalable automation.
   </td>
-</tr>
-   </tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura" target="_blank">
-        <img alt="NiuProxy" src="assets/sponsors/niuproxlogo.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura"><b>NiuProxy</b></a> Rotating Residential Proxies — Special Offer: 10TB at $0.35/GB | 1TB at $0.50/GB.<br><br>
-      🎁 Use code <b>PAY2</b> for <b>10% off</b> your recharge.
-    </td>  
-</tr>
     <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://masklabs.io" target="_blank">
@@ -192,7 +186,9 @@ usable on common LTS servers with glibc 2.35+.
 ### Docker
 
 ```bash
-docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
+docker run -d --name obscura -p 127.0.0.1:9222:9222 \
+  -e OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" \
+  h4ckf0r0day/obscura
 ```
 
 Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc:nonroot` — no shell, no package manager, runs as uid 65532, ~57 MB compressed. A mounted `--storage-dir` must be writable by uid 65532. Publish to host loopback as above; `-p 9222:9222` exposes the port on every interface.
@@ -479,6 +475,11 @@ Start a CDP WebSocket server.
 | `--font-dir` | — | Recursively load fonts once per worker (repeatable; render build) |
 | `--obey-robots` | off | Respect robots.txt |
 
+With multiple workers, exited children are reaped and restarted. New connections
+use ready workers only; if none are ready, the balancer returns HTTP 503. A crash
+still closes that worker's existing sessions, which clients must reconnect.
+Worker errors remain visible on stderr.
+
 ### `obscura fetch <URL>`
 
 Fetch and render a single page.
@@ -534,6 +535,7 @@ Optional flags (both transports):
 |------|-------------|
 | `--proxy <URL>` | HTTP/SOCKS5 proxy |
 | `--user-agent <UA>` | Custom User-Agent string |
+| `--font-dir <DIR>` | Load additional fonts before rendering (repeatable; render build) |
 | `--stealth` | Enable anti-detection mode |
 
 ### Claude Desktop config
